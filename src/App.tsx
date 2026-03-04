@@ -101,27 +101,170 @@ const ThumbnailCard = memo(({ path, selected, onClick }: { path: string; selecte
   );
 });
 
+/* ════════ DevelopParams type ════════ */
+interface DevelopParams {
+  exposure: number;
+  saturation: number;
+  contrast: number;
+  highlights: number;
+  shadows: number;
+  wb_temp_shift: number;
+  wb_tint_shift: number;
+}
+
+const DEFAULT_DEVELOP: DevelopParams = {
+  exposure: 0,
+  saturation: 1.3,
+  contrast: 0,
+  highlights: 0,
+  shadows: 0,
+  wb_temp_shift: 0,
+  wb_tint_shift: 0,
+};
+
+/* ════════ Slider row component ════════ */
+function DevSlider({ label, value, min, max, step, onChange }: {
+  label: string; value: number; min: number; max: number; step: number;
+  onChange: (v: number) => void;
+}) {
+  return (
+    <div className="dev-slider-row">
+      <label className="dev-slider-label">{label}</label>
+      <input
+        type="range" min={min} max={max} step={step} value={value}
+        onChange={(e) => onChange(parseFloat(e.target.value))}
+        className="dev-slider-input"
+      />
+      <span className="dev-slider-value">{value.toFixed(2)}</span>
+    </div>
+  );
+}
+
 /* ════════ PreviewOverlay ════════ */
 function PreviewOverlay({ path, onClose, onPrev, onNext }: { path: string; onClose: () => void; onPrev: () => void; onNext: () => void }) {
   const rawInfo = thumbnailCache.get(path);
   const filename = path.split(/[\\/]/).pop();
+  const [decodedSrc, setDecodedSrc] = useState<string | null>(null);
+  const [decoding, setDecoding] = useState(false);
+  const [decodeError, setDecodeError] = useState<string | null>(null);
+  const [develop, setDevelop] = useState<DevelopParams>({ ...DEFAULT_DEVELOP });
+  const debounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const cancelRef = useRef(false);
+
+  // Decode function with current develop params
+  const doDecode = useCallback((devParams: DevelopParams, immediate?: boolean) => {
+    if (debounceRef.current) clearTimeout(debounceRef.current);
+
+    const run = () => {
+      cancelRef.current = true; // cancel previous
+      cancelRef.current = false;
+      setDecoding(true);
+      setDecodeError(null);
+      const thisCancel = cancelRef;
+
+      invoke<string>("decode_raw_full", {
+        path,
+        maxDimension: 2048,
+        develop: devParams,
+      })
+        .then((src) => { if (!thisCancel.current) setDecodedSrc(src); })
+        .catch((e) => { if (!thisCancel.current) setDecodeError(String(e)); })
+        .finally(() => { if (!thisCancel.current) setDecoding(false); });
+    };
+
+    if (immediate) {
+      run();
+    } else {
+      debounceRef.current = setTimeout(run, 300);
+    }
+  }, [path]);
+
+  // Initial decode when path changes
+  useEffect(() => {
+    setDecodedSrc(null);
+    setDevelop({ ...DEFAULT_DEVELOP });
+    doDecode(DEFAULT_DEVELOP, true);
+    return () => { cancelRef.current = true; };
+  }, [path, doDecode]);
+
+  // Handle slider change
+  const handleSliderChange = useCallback((key: keyof DevelopParams, value: number) => {
+    setDevelop((prev) => {
+      const next = { ...prev, [key]: value };
+      doDecode(next);
+      return next;
+    });
+  }, [doDecode]);
+
+  // Reset all
+  const handleReset = useCallback(() => {
+    setDevelop({ ...DEFAULT_DEVELOP });
+    doDecode(DEFAULT_DEVELOP, true);
+  }, [doDecode]);
+
   useEffect(() => {
     const h = (e: KeyboardEvent) => { if (e.key === "Escape") onClose(); if (e.key === "ArrowLeft") onPrev(); if (e.key === "ArrowRight") onNext(); };
     window.addEventListener("keydown", h);
     return () => window.removeEventListener("keydown", h);
   }, [onClose, onPrev, onNext]);
+
+  const imgSrc = decodedSrc || rawInfo?.thumbnail_base64;
+  const isRawDecoded = !!decodedSrc;
+
   return (
     <div className="preview-overlay" onClick={onClose}>
-      <div onClick={(e) => e.stopPropagation()} style={{ display: "flex", flexDirection: "column", alignItems: "center" }}>
-        {rawInfo?.thumbnail_base64 ? <img src={rawInfo.thumbnail_base64} alt={filename} /> : <div style={{ color: "#888", fontSize: 18 }}>No preview</div>}
-        <div className="preview-info">
-          <strong>{filename}</strong>
-          {rawInfo && <span className="detail">{rawInfo.make} {rawInfo.model} · {rawInfo.width}x{rawInfo.height}</span>}
+      <div className="preview-layout" onClick={(e) => e.stopPropagation()}>
+        {/* Image area */}
+        <div className="preview-image-area">
+          {imgSrc ? (
+            <div style={{ position: "relative" }}>
+              <img src={imgSrc} alt={filename} />
+              {decoding && (
+                <div style={{ position: "absolute", top: 8, right: 8, background: "rgba(0,0,0,0.7)", color: "#fff", padding: "4px 10px", borderRadius: 4, fontSize: 12 }}>
+                  ⏳ RAW Decoding...
+                </div>
+              )}
+              {isRawDecoded && !decoding && (
+                <div style={{ position: "absolute", top: 8, right: 8, background: "rgba(52,120,246,0.9)", color: "#fff", padding: "4px 10px", borderRadius: 4, fontSize: 11, fontWeight: "bold" }}>
+                  RAW
+                </div>
+              )}
+            </div>
+          ) : (
+            <div style={{ color: "#888", fontSize: 18 }}>No preview</div>
+          )}
+          {decodeError && (
+            <div style={{ color: "#ff6b6b", fontSize: 12, marginTop: 8 }}>
+              ⚠ RAW decode failed: {decodeError}
+            </div>
+          )}
+          <div className="preview-info">
+            <strong>{filename}</strong>
+            {rawInfo && <span className="detail">{rawInfo.make} {rawInfo.model} · {rawInfo.width}x{rawInfo.height}</span>}
+          </div>
+          <div className="preview-controls">
+            <button onClick={(e) => { e.stopPropagation(); onPrev(); }}>◀ Prev</button>
+            <button className="close-btn" onClick={(e) => { e.stopPropagation(); onClose(); }}>✕ Close</button>
+            <button onClick={(e) => { e.stopPropagation(); onNext(); }}>Next ▶</button>
+          </div>
         </div>
-        <div className="preview-controls">
-          <button onClick={(e) => { e.stopPropagation(); onPrev(); }}>◀ Prev</button>
-          <button className="close-btn" onClick={(e) => { e.stopPropagation(); onClose(); }}>✕ Close</button>
-          <button onClick={(e) => { e.stopPropagation(); onNext(); }}>Next ▶</button>
+
+        {/* Develop panel */}
+        <div className="develop-panel">
+          <div className="develop-header">
+            <span>現像設定</span>
+            <button className="dev-reset-btn" onClick={handleReset}>Reset</button>
+          </div>
+          <div className="develop-section-title">Light</div>
+          <DevSlider label="Exposure" value={develop.exposure} min={-3} max={3} step={0.1} onChange={(v) => handleSliderChange("exposure", v)} />
+          <DevSlider label="Contrast" value={develop.contrast} min={-1} max={1} step={0.05} onChange={(v) => handleSliderChange("contrast", v)} />
+          <DevSlider label="Highlights" value={develop.highlights} min={-1} max={1} step={0.05} onChange={(v) => handleSliderChange("highlights", v)} />
+          <DevSlider label="Shadows" value={develop.shadows} min={-1} max={1} step={0.05} onChange={(v) => handleSliderChange("shadows", v)} />
+
+          <div className="develop-section-title">Color</div>
+          <DevSlider label="Saturation" value={develop.saturation} min={0} max={2} step={0.05} onChange={(v) => handleSliderChange("saturation", v)} />
+          <DevSlider label="WB Temp" value={develop.wb_temp_shift} min={-1} max={1} step={0.05} onChange={(v) => handleSliderChange("wb_temp_shift", v)} />
+          <DevSlider label="WB Tint" value={develop.wb_tint_shift} min={-1} max={1} step={0.05} onChange={(v) => handleSliderChange("wb_tint_shift", v)} />
         </div>
       </div>
     </div>

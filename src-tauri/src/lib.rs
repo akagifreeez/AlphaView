@@ -3,6 +3,7 @@ use std::fs::{self, File};
 use std::io::{BufReader, Read, Seek, SeekFrom};
 use exif::{Reader, Tag, In};
 use base64::{Engine as _, engine::general_purpose};
+use image::ImageEncoder;
 
 #[derive(Serialize, Clone)]
 struct RawInfo {
@@ -161,16 +162,12 @@ struct DevelopParams {
     wb_tint_shift: Option<f32>,  // -1.0 to +1.0, default 0.0
 }
 
-/// Fully decode RAW pixel data from an ARW file.
-/// Accepts optional develop parameters for exposure, saturation, contrast, etc.
-#[tauri::command(async)]
-fn decode_raw_full(path: String, max_dimension: Option<usize>, develop: Option<DevelopParams>) -> Result<String, String> {
+/// Core RAW decode + develop pipeline shared by preview (`decode_raw_full`)
+/// and full-resolution export (`export_raw_image`). Returns the developed
+/// RGB pixel buffer at up to `max_dimension` on the long edge.
+fn develop_to_rgb(path: &str, max_dimension: usize, dev: &DevelopParams) -> Result<image::RgbImage, String> {
     use rayon::prelude::*;
 
-    let dev = develop.unwrap_or(DevelopParams {
-        exposure: None, saturation: None, contrast: None,
-        highlights: None, shadows: None, wb_temp_shift: None, wb_tint_shift: None,
-    });
     let user_exposure_ev = dev.exposure.unwrap_or(0.0);
     let user_saturation = dev.saturation.unwrap_or(1.3);
     let user_contrast = dev.contrast.unwrap_or(0.0);
@@ -179,10 +176,10 @@ fn decode_raw_full(path: String, max_dimension: Option<usize>, develop: Option<D
     let user_wb_temp = dev.wb_temp_shift.unwrap_or(0.0);
     let user_wb_tint = dev.wb_tint_shift.unwrap_or(0.0);
 
-    let max_dim = max_dimension.unwrap_or(2048);
+    let max_dim = max_dimension;
 
     // Decode RAW file using rawler
-    let mut raw = rawler::decode_file(&path).map_err(|e| format!("RAW decode failed: {}", e))?;
+    let mut raw = rawler::decode_file(path).map_err(|e| format!("RAW decode failed: {}", e))?;
 
     let full_w = raw.width;
     let full_h = raw.height;
@@ -395,7 +392,21 @@ fn decode_raw_full(path: String, max_dimension: Option<usize>, develop: Option<D
     let img_buf = image::RgbImage::from_raw(out_w as u32, out_h as u32, output_bytes)
         .ok_or("Failed to create image buffer")?;
 
-    // Encode as JPEG
+    Ok(img_buf)
+}
+
+/// Fully decode RAW pixel data from an ARW file for on-screen preview.
+/// Accepts optional develop parameters for exposure, saturation, contrast, etc.
+/// Downscales to `max_dimension` (default 2048px) on the long edge for speed.
+#[tauri::command(async)]
+fn decode_raw_full(path: String, max_dimension: Option<usize>, develop: Option<DevelopParams>) -> Result<String, String> {
+    let dev = develop.unwrap_or(DevelopParams {
+        exposure: None, saturation: None, contrast: None,
+        highlights: None, shadows: None, wb_temp_shift: None, wb_tint_shift: None,
+    });
+    let img_buf = develop_to_rgb(&path, max_dimension.unwrap_or(2048), &dev)?;
+
+    // Encode as JPEG for the preview <img> tag
     let mut jpeg_buf = std::io::Cursor::new(Vec::new());
     img_buf
         .write_to(&mut jpeg_buf, image::ImageFormat::Jpeg)
@@ -405,12 +416,53 @@ fn decode_raw_full(path: String, max_dimension: Option<usize>, develop: Option<D
     Ok(format!("data:image/jpeg;base64,{}", b64))
 }
 
+/// Develop a RAW file at full sensor resolution with the given adjustments
+/// and save it directly to disk as JPEG or PNG. `quality` (1-100) only
+/// applies to JPEG output; defaults to 92.
+#[tauri::command(async)]
+fn export_raw_image(
+    path: String,
+    develop: Option<DevelopParams>,
+    out_path: String,
+    format: String,
+    quality: Option<u8>,
+) -> Result<(), String> {
+    let dev = develop.unwrap_or(DevelopParams {
+        exposure: None, saturation: None, contrast: None,
+        highlights: None, shadows: None, wb_temp_shift: None, wb_tint_shift: None,
+    });
+    // Cap far above any real sensor dimension so the pipeline never downscales.
+    let img_buf = develop_to_rgb(&path, 1_000_000, &dev)?;
+
+    match format.to_lowercase().as_str() {
+        "png" => {
+            img_buf
+                .save_with_format(&out_path, image::ImageFormat::Png)
+                .map_err(|e| format!("PNG export failed: {}", e))?;
+        }
+        _ => {
+            let q = quality.unwrap_or(92).clamp(1, 100);
+            let file = File::create(&out_path).map_err(|e| e.to_string())?;
+            let encoder = image::codecs::jpeg::JpegEncoder::new_with_quality(file, q);
+            encoder
+                .write_image(
+                    img_buf.as_raw(),
+                    img_buf.width(),
+                    img_buf.height(),
+                    image::ExtendedColorType::Rgb8,
+                )
+                .map_err(|e| format!("JPEG export failed: {}", e))?;
+        }
+    }
+    Ok(())
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
-        .invoke_handler(tauri::generate_handler![list_arw_files, load_raw_info, decode_raw_full])
+        .invoke_handler(tauri::generate_handler![list_arw_files, load_raw_info, decode_raw_full, export_raw_image])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }

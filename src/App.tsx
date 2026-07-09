@@ -1,6 +1,6 @@
 import { useState, useEffect, useRef, useCallback, useMemo, memo } from "react";
 import { invoke } from "@tauri-apps/api/core";
-import { open } from "@tauri-apps/plugin-dialog";
+import { open, save } from "@tauri-apps/plugin-dialog";
 import "./App.css";
 
 interface RawInfo {
@@ -150,6 +150,8 @@ function PreviewOverlay({ path, onClose, onPrev, onNext }: { path: string; onClo
   const [develop, setDevelop] = useState<DevelopParams>({ ...DEFAULT_DEVELOP });
   const debounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const cancelRef = useRef(false);
+  const [exportState, setExportState] = useState<"idle" | "exporting" | "done" | "error">("idle");
+  const [exportMsg, setExportMsg] = useState<string | null>(null);
 
   // Decode function with current develop params
   const doDecode = useCallback((devParams: DevelopParams, immediate?: boolean) => {
@@ -201,6 +203,32 @@ function PreviewOverlay({ path, onClose, onPrev, onNext }: { path: string; onClo
     setDevelop({ ...DEFAULT_DEVELOP });
     doDecode(DEFAULT_DEVELOP, true);
   }, [doDecode]);
+
+  // Export the current develop settings to a full-resolution file on disk
+  const handleExport = useCallback(async () => {
+    const baseName = (path.split(/[\\/]/).pop() || "photo").replace(/\.arw$/i, "");
+    setExportMsg(null);
+    try {
+      const outPath = await save({
+        title: "Export developed image",
+        defaultPath: `${baseName}.jpg`,
+        filters: [
+          { name: "JPEG", extensions: ["jpg", "jpeg"] },
+          { name: "PNG", extensions: ["png"] },
+        ],
+      });
+      if (!outPath) return; // user cancelled
+
+      setExportState("exporting");
+      const format = outPath.toLowerCase().endsWith(".png") ? "png" : "jpeg";
+      await invoke("export_raw_image", { path, develop, outPath, format, quality: 92 });
+      setExportState("done");
+      setExportMsg(outPath);
+    } catch (e) {
+      setExportState("error");
+      setExportMsg(String(e));
+    }
+  }, [path, develop]);
 
   useEffect(() => {
     const h = (e: KeyboardEvent) => { if (e.key === "Escape") onClose(); if (e.key === "ArrowLeft") onPrev(); if (e.key === "ArrowRight") onNext(); };
@@ -265,6 +293,26 @@ function PreviewOverlay({ path, onClose, onPrev, onNext }: { path: string; onClo
           <DevSlider label="Saturation" value={develop.saturation} min={0} max={2} step={0.05} onChange={(v) => handleSliderChange("saturation", v)} />
           <DevSlider label="WB Temp" value={develop.wb_temp_shift} min={-1} max={1} step={0.05} onChange={(v) => handleSliderChange("wb_temp_shift", v)} />
           <DevSlider label="WB Tint" value={develop.wb_tint_shift} min={-1} max={1} step={0.05} onChange={(v) => handleSliderChange("wb_tint_shift", v)} />
+
+          <div className="develop-section-title" style={{ marginTop: "16px" }}>Export</div>
+          <button
+            className="btn btn-primary"
+            style={{ width: "100%" }}
+            disabled={exportState === "exporting"}
+            onClick={handleExport}
+          >
+            {exportState === "exporting" ? "⏳ Exporting…" : "💾 Export full-res JPEG/PNG"}
+          </button>
+          {exportState === "done" && exportMsg && (
+            <div style={{ color: "var(--text-dim)", fontSize: 11, marginTop: 6, wordBreak: "break-all" }}>
+              ✅ Saved: {exportMsg}
+            </div>
+          )}
+          {exportState === "error" && exportMsg && (
+            <div style={{ color: "#ff6b6b", fontSize: 11, marginTop: 6 }}>
+              ⚠ Export failed: {exportMsg}
+            </div>
+          )}
         </div>
       </div>
     </div>
